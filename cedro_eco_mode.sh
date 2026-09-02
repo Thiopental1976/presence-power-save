@@ -34,20 +34,25 @@ expand_range() {
     done
 }
 
-# Maior cpuinfo_max_freq (kHz) entre os CPUs do range dado. Imprime "freq cpu"
-# (freq=0 cpu="" se nao conseguir ler nenhum — chamador decide o que fazer).
+# Maior cpuinfo_max_freq (kHz) entre os CPUs do range dado. Imprime
+# "freq cpu1,cpu2,..." — TODOS os CPUs empatados no topo, nao só o primeiro
+# encontrado (num 13700K, por ex., os 4 threads dos 2 núcleos "favoritos"
+# do Turbo Boost Max 3.0 empatam na frequência máxima, não é só um).
+# freq=0 lista="" se nao conseguir ler nenhum — chamador decide o que fazer.
 max_freq_khz() {
-    local best=0 best_cpu="" n f v
+    local best=0 best_list="" n f v
     while read -r n; do
         f="/sys/devices/system/cpu/cpu$n/cpufreq/cpuinfo_max_freq"
         [[ -r "$f" ]] || continue
         v=$(cat "$f")
         if (( v > best )); then
             best=$v
-            best_cpu=$n
+            best_list="$n"
+        elif (( v == best )); then
+            best_list="$best_list,$n"
         fi
     done < <(expand_range "$1")
-    echo "$best $best_cpu"
+    echo "$best $best_list"
 }
 
 detect_topology() {
@@ -69,9 +74,9 @@ detect_topology() {
     # protege a portabilidade pra outras maquinas: se a deteccao por nome
     # estiver errada (bug de kernel, topologia atipica), aborta em vez de
     # confinar o lado de alta potencia por engano.
-    read -r p_max p_max_cpu <<< "$(max_freq_khz "$PCORES")"
-    read -r e_max e_max_cpu <<< "$(max_freq_khz "$ECORES")"
-    if [[ -z "$p_max_cpu" || -z "$e_max_cpu" ]]; then
+    read -r p_max p_max_list <<< "$(max_freq_khz "$PCORES")"
+    read -r e_max e_max_list <<< "$(max_freq_khz "$ECORES")"
+    if [[ -z "$p_max_list" || -z "$e_max_list" ]]; then
         echo "AVISO: nao consegui ler cpuinfo_max_freq de algum grupo — pulando a" >&2
         echo "validacao cruzada de frequencia (seguindo so pelo nome sysfs)." >&2
     elif (( p_max <= e_max )); then
@@ -81,7 +86,7 @@ detect_topology() {
         echo "por seguranca em vez de arriscar confinar o lado de alta potencia." >&2
         exit 1
     fi
-    PCORES_PEAK_CPU="cpu${p_max_cpu}"
+    PCORES_PEAK_CPUS=$(sed 's/^/cpu/; s/,/, cpu/g' <<< "$p_max_list")
     PCORES_PEAK_MHZ=$(( p_max / 1000 ))
 }
 
@@ -105,7 +110,7 @@ case "$action" in
     on)
         detect_topology
         echo "Restringindo o sistema inteiro aos E-cores ($ECORES). P-cores ($PCORES) ficam livres/ociosos."
-        echo "Nucleo de maior potencia entre os P-cores: $PCORES_PEAK_CPU (${PCORES_PEAK_MHZ}MHz max) — ocioso durante o modo eco."
+        echo "Nucleos de maior potencia entre os P-cores: $PCORES_PEAK_CPUS (${PCORES_PEAK_MHZ}MHz max) — ociosos durante o modo eco."
         run systemctl set-property --runtime system.slice "AllowedCPUs=$ECORES"
         run systemctl set-property --runtime user.slice "AllowedCPUs=$ECORES"
         ;;
