@@ -22,7 +22,7 @@ set -euo pipefail
 
 # Expande um range tipo "0-15,20" numa lista de numeros de CPU, um por linha.
 expand_range() {
-    local ranges="$1" part lo hi n
+    local ranges="$1" part lo hi n parts
     IFS=',' read -ra parts <<< "$ranges"
     for part in "${parts[@]}"; do
         if [[ "$part" == *-* ]]; then
@@ -55,7 +55,20 @@ max_freq_khz() {
     echo "$best $best_list"
 }
 
-detect_topology() {
+# ALLCORES sozinho — NUNCA falha, sem depender de a CPU ser hibrida. `off` (o
+# caminho de restauracao/failsafe) usa só isto: o resgate de "volta tudo ao
+# normal" nao pode ficar refem de deteccao de P/E-core nem da validacao por
+# frequencia abaixo, ou o proprio failsafe vira um jeito novo de travar preso
+# no modo eco.
+detect_allcores() {
+    ALLCORES=$(cat /sys/devices/system/cpu/online)
+}
+
+# Deteccao de P-cores/E-cores + validacao cruzada por frequencia. Só usada por
+# `on` (que precisa saber qual lado confinar) e por `status` (só de forma
+# informativa, com degradacao graciosa). Retorna 1 (nao "exit") em caso de
+# falha — quem chama decide se isso é fatal ou so um "sem info extra".
+detect_pe_topology() {
     if [[ -r /sys/devices/cpu_core/cpus && -r /sys/devices/cpu_atom/cpus ]]; then
         PCORES=$(cat /sys/devices/cpu_core/cpus)
         ECORES=$(cat /sys/devices/cpu_atom/cpus)
@@ -64,9 +77,8 @@ detect_topology() {
         echo "Isso significa que nao e uma CPU hibrida Intel (Alder Lake ou mais nova)" >&2
         echo "com P-cores/E-cores distintos, ou o kernel e anterior ao 5.16." >&2
         echo "Modo eco nao tem o que fazer aqui: nao ha E-cores para confinar o sistema." >&2
-        exit 1
+        return 1
     fi
-    ALLCORES=$(cat /sys/devices/system/cpu/online)
 
     # Validacao cruzada por frequencia: nao confia cegamente no nome do grupo
     # sysfs (cpu_core/cpu_atom) — confirma que o grupo P realmente TEM a
@@ -84,10 +96,11 @@ detect_topology() {
         echo "frequencia maxima maior que o grupo E-cores ($ECORES, max ${e_max}kHz)." >&2
         echo "A deteccao de topologia esta inconsistente nesta maquina — abortando" >&2
         echo "por seguranca em vez de arriscar confinar o lado de alta potencia." >&2
-        exit 1
+        return 1
+    else
+        PCORES_PEAK_CPUS=$(sed 's/^/cpu/; s/,/, cpu/g' <<< "$p_max_list")
+        PCORES_PEAK_MHZ=$(( p_max / 1000 ))
     fi
-    PCORES_PEAK_CPUS=$(sed 's/^/cpu/; s/,/, cpu/g' <<< "$p_max_list")
-    PCORES_PEAK_MHZ=$(( p_max / 1000 ))
 }
 
 usage() { echo "Uso: $0 on|off|status [--execute]" >&2; exit 2; }
@@ -108,20 +121,25 @@ run() {
 
 case "$action" in
     on)
-        detect_topology
+        detect_allcores
+        detect_pe_topology || exit 1
         echo "Restringindo o sistema inteiro aos E-cores ($ECORES). P-cores ($PCORES) ficam livres/ociosos."
         echo "Nucleos de maior potencia entre os P-cores: $PCORES_PEAK_CPUS (${PCORES_PEAK_MHZ}MHz max) — ociosos durante o modo eco."
         run systemctl set-property --runtime system.slice "AllowedCPUs=$ECORES"
         run systemctl set-property --runtime user.slice "AllowedCPUs=$ECORES"
         ;;
     off)
-        detect_topology
+        # Caminho de restauracao/failsafe — so precisa saber "todos os cores".
+        # Nao chama detect_pe_topology de proposito: isso teria que funcionar
+        # mesmo se a validacao de topologia falhar, senao o proprio resgate
+        # vira um novo jeito de travar preso no modo eco.
+        detect_allcores
         echo "Removendo restricao — sistema volta a usar todos os cores ($ALLCORES)."
         run systemctl set-property --runtime system.slice "AllowedCPUs=$ALLCORES"
         run systemctl set-property --runtime user.slice "AllowedCPUs=$ALLCORES"
         ;;
     status)
-        detect_topology
+        detect_allcores
         cur_sys=$(systemctl show -p AllowedCPUs --value system.slice 2>/dev/null)
         cur_usr=$(systemctl show -p AllowedCPUs --value user.slice 2>/dev/null)
         is_full() { [[ -z "$1" || "$1" == "$ALLCORES" ]]; }
@@ -129,6 +147,9 @@ case "$action" in
             echo "Modo eco: DESLIGADO (sem restricao, todos os cores disponiveis: $ALLCORES)"
         else
             echo "Modo eco: LIGADO — system.slice AllowedCPUs=$cur_sys | user.slice AllowedCPUs=$cur_usr"
+        fi
+        if detect_pe_topology; then
+            echo "P-cores: $PCORES | E-cores: $ECORES | nucleo(s) de maior potencia: $PCORES_PEAK_CPUS (${PCORES_PEAK_MHZ}MHz max)"
         fi
         ;;
     *) usage ;;

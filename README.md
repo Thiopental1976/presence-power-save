@@ -48,6 +48,16 @@ Para "tela ligada", a fonte é o estado DPMS via `xset q` — uma leitura pura
 que não gera nenhum evento X, portanto imune ao mesmo problema de
 auto-interferência.
 
+**Limite conhecido**: o sinal de "sessão remota ativa" confia em qualquer
+conexão TCP estabelecida na porta do RustDesk que ultrapasse o limiar de
+`bytes_received` — não em uma sessão *autenticada*. Numa máquina exposta a
+uma rede não confiável (sem VPN/Tailscale na frente), tráfego de
+varredura/abuso nessa porta poderia, em teoria, ser lido como presença e
+manter o sistema em energia total. Nesta implantação a porta só é
+alcançável via Tailscale, o que fecha essa lacuna na prática — mas vale
+como aviso para quem for adaptar isto rodando com a porta exposta direto na
+internet.
+
 ## Arquitetura
 
 - Um daemon único (`cedro_presence_daemon.py`, Python 3 + `dbus`/`gi`,
@@ -84,8 +94,16 @@ ln -s "$(pwd)/cedro-presence.service"   ~/.config/systemd/user/cedro-presence.se
 # user.slice sem senha interativa (só essa ação, só essas duas units — ver
 # comentário no arquivo da regra). Sem isto o daemon não consegue aplicar o
 # modo eco, porque roda sem terminal e nunca chama sudo.
-sudo cp polkit/49-cedro-eco-mode.rules /etc/polkit-1/rules.d/
+#
+# Use `install`, não `cp`: polkitd roda como um usuário de sistema próprio
+# (não root) e precisa conseguir LER o arquivo. Um `sudo cp` a partir de um
+# diretório com permissão restrita (ex.: clone em pasta 0770) pode herdar o
+# umask de root e sair 0640 — ilegível pro polkitd, com a regra falhando em
+# silêncio (só aparece em `journalctl -u polkit` como "Error loading script").
+sudo install -m 0644 -o root -g root polkit/49-cedro-eco-mode.rules /etc/polkit-1/rules.d/
 sudo systemctl restart polkit
+# Confirme que carregou: a linha abaixo NÃO deve aparecer.
+sudo journalctl -u polkit -n 20 --no-pager | grep -i "error loading" && echo "regra NAO carregou, revise permissoes" || echo "regra carregada OK"
 
 systemctl --user daemon-reload
 systemctl --user enable --now cedro-presence.service
@@ -123,6 +141,17 @@ grupo `sudo`. Isso existe porque o daemon roda como `systemd --user` sem
 terminal: um `sudo` interativo travaria esperando senha que nunca chega, e
 um NOPASSWD amplo em `/etc/sudoers.d` seria um privilégio bem mais largo
 que o necessário.
+
+**Risco residual da regra polkit** (aceito conscientemente, não é um bug):
+ela autoriza qualquer verbo `set-property` nessas duas units, não só
+`AllowedCPUs=...` — um processo malicioso rodando como o próprio usuário
+(já teria que estar nessa posição pra explorar isto) poderia, por exemplo,
+setar `MemoryMax=32M` ou `IPAddressDeny=any` sem senha, e sem o `--runtime`
+usado por este projeto isso persistiria além do reboot. É uma superfície de
+negação-de-serviço (nenhum caminho de execução de código), escopada a duas
+units específicas — bem mais estreita que um NOPASSWD total, mas não é
+"só liga/desliga E-cores". Quem adaptar isto pra outro uso deve manter essa
+restrição em mente.
 
 `cedro_presence_ctl.sh pause` / `resume` ligam/desligam a automação sem
 parar o serviço (kill-switch em arquivo, `~/.cedro-sched-disable`).

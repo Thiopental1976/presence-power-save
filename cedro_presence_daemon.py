@@ -414,8 +414,15 @@ class PresenceDaemon:
         sys_, usr_ = cur("system.slice"), cur("user.slice")
         if sys_ is None or usr_ is None:
             return None
-        cheio = os.cpu_count()
-        allcores = f"0-{cheio - 1}" if cheio else ""
+        # Mesma fonte que o lado shell (cedro_eco_mode.sh): /sys/devices/system/
+        # cpu/online, nao um "0-(N-1)" adivinhado a partir de os.cpu_count() —
+        # isso quebraria em qualquer maquina com CPU offline/hotplug (ex.:
+        # "0-7,16-23"), fazendo o daemon achar pra sempre que esta preso em ECO
+        # e reaplicar "off" a cada tick sem necessidade.
+        try:
+            allcores = Path("/sys/devices/system/cpu/online").read_text().strip()
+        except OSError:
+            allcores = ""
 
         def is_full(v):
             return v in ("", allcores)
@@ -427,7 +434,11 @@ class PresenceDaemon:
         try:
             subprocess.run(cmd, env=_child_env(), capture_output=True, text=True, timeout=15, check=True)
             return True
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as e:
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.strip() if e.stderr else "(sem stderr)"
+            log(f"ERRO: falha ao chamar cedro_eco_mode.sh {acao} (rc={e.returncode}): {stderr}")
+            return False
+        except (subprocess.TimeoutExpired, OSError) as e:
             log(f"ERRO: falha ao chamar cedro_eco_mode.sh {acao}: {e}")
             return False
 
@@ -447,8 +458,11 @@ class PresenceDaemon:
         if KILL_SWITCH.exists():
             if not self.passive:
                 log(f"kill-switch presente ({KILL_SWITCH}) — restaurando FULL e entrando em modo passivo")
-            if self._run_eco_mode("off"):
-                self.last_applied = "FULL"
+                # so na transicao pro modo passivo, nao a cada tick — senao
+                # martela cedro_eco_mode.sh off (2 chamadas systemctl) a cada
+                # 10s pra sempre enquanto o kill-switch existir.
+                if self._run_eco_mode("off"):
+                    self.last_applied = "FULL"
             self.passive = True
             write_state(alvo="FULL", real=self.estado_real() or "?", held_by="kill-switch",
                         bt=self.bt, usb=self.usb, screen=self.screen, rd_active=self.rd_active,
