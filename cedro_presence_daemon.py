@@ -73,6 +73,13 @@ DEVICE_IFACE = "org.bluez.Device1"
 RUSTDESK_PORTS = {"21115", "21116", "21117", "21118", "21119"}
 RUSTDESK_RX_THRESHOLD_PER_TICK = 512  # bytes, calibrado: piso de keepalive medido = 16B/2s (~80B/tick)
 
+BT_RECONNECT_INTERVAL_S = int(os.environ.get("PRESENCE_BT_RECONNECT_INTERVAL_S", "30"))
+# Android nao reconecta sozinho a um pareamento sem perfil de audio/telefonia
+# ativo em uso — confirmado neste servidor em 02/09/2026: celular no bolso,
+# Bluetooth ligado, "Connected: no" ate o lado do PC tentar `Connect()`
+# manualmente (funcionou na hora). Por isso o servidor toma a iniciativa
+# periodicamente em vez de só escutar passivamente o BlueZ.
+
 
 def log(msg):
     linha = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
@@ -229,6 +236,8 @@ class BluetoothWatcher:
         self.on_change = on_change
         self.connected = False
         self.device_path = None
+        self._connecting = False
+        self._last_connect_error = None
         self.bus = dbus.SystemBus()
         self.bus.add_signal_receiver(
             self._interfaces_added, dbus_interface=OM_IFACE,
@@ -238,6 +247,7 @@ class BluetoothWatcher:
             signal_name="InterfacesRemoved", bus_name=BLUEZ)
         self.bus.watch_name_owner(BLUEZ, self._bluez_owner_changed)
         self._find_device()
+        GLib.timeout_add_seconds(BT_RECONNECT_INTERVAL_S, self._maybe_reconnect)
 
     def _find_device(self):
         # Nunca hardcodar /org/bluez/hci0/...: o adaptador pode virar hci1
@@ -304,6 +314,48 @@ class BluetoothWatcher:
                 log("sinal: bluetoothd sumiu do bus")
                 self.on_change()
 
+    def _maybe_reconnect(self):
+        """Chamado a cada BT_RECONNECT_INTERVAL_S: tenta `Connect()` proativamente
+        enquanto desconectado. Ver comentário de BT_RECONNECT_INTERVAL_S — o
+        celular não retoma o link clássico por conta própria, então é o
+        servidor que precisa tomar a iniciativa quando ele estiver por perto."""
+        if self.connected:
+            return True
+        if self.device_path is None:
+            self._find_device()
+        if self.device_path is not None and not self._connecting:
+            self._try_connect()
+        return True  # GLib: continuar repetindo
+
+    def _try_connect(self):
+        self._connecting = True
+        try:
+            obj = self.bus.get_object(BLUEZ, self.device_path)
+            obj.Connect(dbus_interface=DEVICE_IFACE,
+                        reply_handler=self._on_connect_reply,
+                        error_handler=self._on_connect_error)
+        except dbus.DBusException as e:
+            self._connecting = False
+            log(f"sinal: bt falha ao iniciar tentativa de reconexao proativa ({e})")
+
+    def _on_connect_reply(self):
+        self._connecting = False
+        self._last_connect_error = None
+        log("sinal: bt reconexao proativa bem-sucedida")
+        # Connected=True normalmente já chegou via PropertiesChanged
+        # (_properties_changed já chama on_change) — não duplicar aqui.
+
+    def _on_connect_error(self, e):
+        self._connecting = False
+        erro = str(e)
+        # Throttle: enquanto o celular estiver fora de alcance, toda tentativa
+        # falha do mesmo jeito a cada 30s — logar isso pra sempre inundaria o
+        # log em horas de ausência. Só loga na primeira falha e quando o erro
+        # muda (ex.: de "fora de alcance" pra outra causa).
+        if erro != self._last_connect_error:
+            log(f"sinal: bt tentativa de reconexao proativa falhou ({erro})")
+            self._last_connect_error = erro
+
 
 class PresenceDaemon:
     def __init__(self, bt_mac, usb_vendor, execute):
@@ -316,7 +368,8 @@ class PresenceDaemon:
         self.rd_peer = None
         self.rd_prev = {}           # key -> bytes_received da última amostra
 
-        self.absent_since = None
+        self.absent_since = None        # time.monotonic() — fonte de verdade da janela
+        self.absent_since_epoch = None  # time.time() — só pra exibição (write_state/ctl)
         self.last_applied = None    # último alvo que ESTE daemon efetivamente aplicou
         self.passive = False        # cedendo a kill-switch ou ao watchdog
 
@@ -346,7 +399,11 @@ class PresenceDaemon:
         return "+".join(partes) if partes else "-"
 
     def _dentro_da_janela(self):
-        return self.absent_since is not None and (time.time() - self.absent_since) < ABSENCE_WINDOW_S
+        # monotonic, nao time.time(): um salto de relogio de parede (sync NTP
+        # apos boot com RTC errado — ja aconteceu nesta maquina) mudaria a
+        # duracao real da janela sem nenhum evento de presenca de verdade
+        # (achado do Fable 5, 02/09/2026).
+        return self.absent_since is not None and (time.monotonic() - self.absent_since) < ABSENCE_WINDOW_S
 
     def _sample_usb_screen(self):
         novo_usb = usb_present(self.usb_vendor)
@@ -427,7 +484,20 @@ class PresenceDaemon:
         def is_full(v):
             return v in ("", allcores)
 
-        return "FULL" if is_full(sys_) and is_full(usr_) else "ECO"
+        sys_full, usr_full = is_full(sys_), is_full(usr_)
+        if sys_full and usr_full:
+            return "FULL"
+        if not sys_full and not usr_full and sys_ == usr_:
+            return "ECO"
+        # Confinamento parcial: um slice restrito e o outro nao, ou restritos
+        # a ranges diferentes (ex.: a segunda chamada de set-property do "on"
+        # falhou/deu timeout no meio do caminho). NUNCA tratar isto como
+        # convergido: MISTO nunca é igual a "FULL" nem a "ECO" na comparacao
+        # de reevaluate(), entao sempre reaplica — sem isto, "ECO" (o valor
+        # antigo pra qualquer coisa != FULL) deixava o user.slice preso em
+        # FULL pra sempre com o log dizendo que estava em economia (achado
+        # do Fable 5, 02/09/2026).
+        return "MISTO"
 
     def _run_eco_mode(self, acao):
         cmd = [str(ECO_MODE_SH), acao] + (["--execute"] if self.execute else [])
@@ -444,30 +514,38 @@ class PresenceDaemon:
 
     def reevaluate(self):
         agora = time.time()
+        agora_mono = time.monotonic()
         if self.present:
             if self.absent_since is not None:
                 log("sinal: janela_cancelada (presenca retomada)")
             self.absent_since = None
+            self.absent_since_epoch = None
         elif self.absent_since is None:
-            self.absent_since = agora
+            self.absent_since = agora_mono
+            self.absent_since_epoch = agora
             log("sinal: janela_iniciada (10min)")
-        elif self._dentro_da_janela() is False and (agora - self.absent_since) < ABSENCE_WINDOW_S + TICK_SECONDS:
+        elif self._dentro_da_janela() is False and (agora_mono - self.absent_since) < ABSENCE_WINDOW_S + TICK_SECONDS:
             # cruzou o limiar de 10min neste tick
             log("sinal: janela_expirada")
 
         if KILL_SWITCH.exists():
             if not self.passive:
                 log(f"kill-switch presente ({KILL_SWITCH}) — restaurando FULL e entrando em modo passivo")
-                # so na transicao pro modo passivo, nao a cada tick — senao
-                # martela cedro_eco_mode.sh off (2 chamadas systemctl) a cada
-                # 10s pra sempre enquanto o kill-switch existir.
+                # so entra em modo passivo (e para de tentar) DEPOIS que a
+                # restauracao realmente funcionar — senao martela
+                # cedro_eco_mode.sh off (2 chamadas systemctl) a cada 10s pra
+                # sempre. Mas se falhar, precisa continuar tentando a cada
+                # tick (self.passive fica False), senao uma falha transitoria
+                # trava o resgate do kill-switch pra sempre.
                 if self._run_eco_mode("off"):
                     self.last_applied = "FULL"
-            self.passive = True
+                    self.passive = True
+                else:
+                    log("ERRO: falha ao restaurar FULL via kill-switch — tentando novamente no proximo tick")
             write_state(alvo="FULL", real=self.estado_real() or "?", held_by="kill-switch",
                         bt=self.bt, usb=self.usb, screen=self.screen, rd_active=self.rd_active,
                         rd_peer=self.rd_peer or "-", mode="passivo(kill-switch)",
-                        absent_since=int(self.absent_since) if self.absent_since else "-")
+                        absent_since=int(self.absent_since_epoch) if self.absent_since_epoch else "-")
             return
 
         if WATCHDOG_ARMED.exists():
@@ -477,7 +555,7 @@ class PresenceDaemon:
             write_state(alvo="?", real=self.estado_real() or "?", held_by="watchdog",
                         bt=self.bt, usb=self.usb, screen=self.screen, rd_active=self.rd_active,
                         rd_peer=self.rd_peer or "-", mode="passivo(watchdog)",
-                        absent_since=int(self.absent_since) if self.absent_since else "-")
+                        absent_since=int(self.absent_since_epoch) if self.absent_since_epoch else "-")
             return
 
         if self.passive:
@@ -506,7 +584,7 @@ class PresenceDaemon:
             alvo=alvo, real=real or "?", held_by=self.held_by(),
             bt=self.bt, usb=self.usb, screen=self.screen, rd_active=self.rd_active,
             rd_peer=self.rd_peer or "-", mode="execute" if self.execute else "observador",
-            absent_since=int(self.absent_since) if self.absent_since else "-",
+            absent_since=int(self.absent_since_epoch) if self.absent_since_epoch else "-",
             applied_at=int(agora),
         )
 

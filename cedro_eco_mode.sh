@@ -86,6 +86,12 @@ detect_pe_topology() {
     # protege a portabilidade pra outras maquinas: se a deteccao por nome
     # estiver errada (bug de kernel, topologia atipica), aborta em vez de
     # confinar o lado de alta potencia por engano.
+    # Defaults: se a validacao de frequencia for pulada (AVISO abaixo), estas
+    # ficam vazias — quem usa detect_pe_topology precisa checar antes de
+    # imprimir, em vez de assumir que sempre vem preenchida.
+    PCORES_PEAK_CPUS=""
+    PCORES_PEAK_MHZ=""
+
     read -r p_max p_max_list <<< "$(max_freq_khz "$PCORES")"
     read -r e_max e_max_list <<< "$(max_freq_khz "$ECORES")"
     if [[ -z "$p_max_list" || -z "$e_max_list" ]]; then
@@ -124,9 +130,24 @@ case "$action" in
         detect_allcores
         detect_pe_topology || exit 1
         echo "Restringindo o sistema inteiro aos E-cores ($ECORES). P-cores ($PCORES) ficam livres/ociosos."
-        echo "Nucleos de maior potencia entre os P-cores: $PCORES_PEAK_CPUS (${PCORES_PEAK_MHZ}MHz max) — ociosos durante o modo eco."
-        run systemctl set-property --runtime system.slice "AllowedCPUs=$ECORES"
-        run systemctl set-property --runtime user.slice "AllowedCPUs=$ECORES"
+        if [[ -n "$PCORES_PEAK_CPUS" ]]; then
+            echo "Nucleos de maior potencia entre os P-cores: $PCORES_PEAK_CPUS (${PCORES_PEAK_MHZ}MHz max) — ociosos durante o modo eco."
+        fi
+        # --no-ask-password: se o polkit nao autorizar silenciosamente (regra
+        # nao carregada, polkitd reiniciando), falha em ms com "Interactive
+        # authentication required" em vez de abrir um dialogo de senha na
+        # tela grafica e deixar um systemctl orfao pendurado (visto em
+        # producao 02/09, 14:56-14:58 — journal do polkit confirma).
+        if ! run systemctl set-property --runtime --no-ask-password system.slice "AllowedCPUs=$ECORES"; then
+            echo "ERRO: falha ao confinar system.slice — abortando sem tocar user.slice." >&2
+            exit 1
+        fi
+        if ! run systemctl set-property --runtime --no-ask-password user.slice "AllowedCPUs=$ECORES"; then
+            echo "ERRO: falha ao confinar user.slice — desfazendo system.slice pra nao deixar" >&2
+            echo "o sistema num estado misto (so metade confinada aos E-cores)." >&2
+            run systemctl set-property --runtime --no-ask-password system.slice "AllowedCPUs=$ALLCORES"
+            exit 1
+        fi
         ;;
     off)
         # Caminho de restauracao/failsafe — so precisa saber "todos os cores".
@@ -135,8 +156,16 @@ case "$action" in
         # vira um novo jeito de travar preso no modo eco.
         detect_allcores
         echo "Removendo restricao — sistema volta a usar todos os cores ($ALLCORES)."
-        run systemctl set-property --runtime system.slice "AllowedCPUs=$ALLCORES"
-        run systemctl set-property --runtime user.slice "AllowedCPUs=$ALLCORES"
+        # Tenta os dois slices independente do resultado do primeiro — este e
+        # o caminho de resgate, maximizar quantos cores voltam importa mais
+        # que abortar cedo (set -e nao se aplica aqui de proposito, por isso
+        # o "|| { ...; }" em vez de deixar a falha propagar).
+        ok=1
+        run systemctl set-property --runtime --no-ask-password system.slice "AllowedCPUs=$ALLCORES" \
+            || { echo "ERRO: falha ao restaurar system.slice" >&2; ok=0; }
+        run systemctl set-property --runtime --no-ask-password user.slice "AllowedCPUs=$ALLCORES" \
+            || { echo "ERRO: falha ao restaurar user.slice" >&2; ok=0; }
+        (( ok )) || exit 1
         ;;
     status)
         detect_allcores
@@ -149,7 +178,11 @@ case "$action" in
             echo "Modo eco: LIGADO — system.slice AllowedCPUs=$cur_sys | user.slice AllowedCPUs=$cur_usr"
         fi
         if detect_pe_topology; then
-            echo "P-cores: $PCORES | E-cores: $ECORES | nucleo(s) de maior potencia: $PCORES_PEAK_CPUS (${PCORES_PEAK_MHZ}MHz max)"
+            if [[ -n "$PCORES_PEAK_CPUS" ]]; then
+                echo "P-cores: $PCORES | E-cores: $ECORES | nucleo(s) de maior potencia: $PCORES_PEAK_CPUS (${PCORES_PEAK_MHZ}MHz max)"
+            else
+                echo "P-cores: $PCORES | E-cores: $ECORES"
+            fi
         fi
         ;;
     *) usage ;;

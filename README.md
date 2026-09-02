@@ -62,8 +62,18 @@ internet.
 
 - Um daemon único (`cedro_presence_daemon.py`, Python 3 + `dbus`/`gi`,
   sem dependência de pip), loop de eventos GLib.
-- Bluetooth é orientado a evento (sinal D-Bus `PropertiesChanged` do BlueZ na
-  propriedade `Connected` — nunca `Paired`, que é permanente).
+- Bluetooth é orientado a evento pra **detectar** presença (sinal D-Bus
+  `PropertiesChanged` do BlueZ na propriedade `Connected` — nunca `Paired`,
+  que é permanente), mas o servidor toma a iniciativa de **reconectar**:
+  Android não retoma o link clássico sozinho a um pareamento sem perfil de
+  áudio/telefonia realmente em uso (confirmado neste servidor em
+  02/09/2026 — celular no bolso, Bluetooth ligado, `Connected: no` até o
+  lado do PC chamar `Device1.Connect()`, que funcionou na hora). Por isso,
+  a cada `PRESENCE_BT_RECONNECT_INTERVAL_S` (padrão 30s, ver
+  `presence.env.example`) o daemon tenta `Connect()` de forma assíncrona
+  (nunca bloqueia o loop GLib) enquanto estiver desconectado — falhas
+  repetidas (celular fora de alcance) só logam uma vez, não a cada
+  tentativa.
 - USB e tela são amostrados por poll leve (sysfs / `xset q`).
 - A sessão remota é amostrada via `ss` (estado TCP + `tcp_info`).
 - Nenhum sinal aplica nada diretamente — todos convergem numa FSM simples

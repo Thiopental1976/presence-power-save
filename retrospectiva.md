@@ -65,6 +65,27 @@
   específica, não um valor validado em produção por semanas. O daemon
   loga a taxa bruta durante o burn-in exatamente para permitir recalibrar
   com dados reais em vez de behavior assumido.
+- **Duas rodadas de auditoria independente (code-review nível max + Fable 5,
+  02/09/2026) acharam bugs reais que passaram pela implementação inicial E
+  pela primeira correção do Fable.** Achado em comum, encontrado pelos dois
+  de forma independente: o resgate do kill-switch entrava em modo passivo
+  mesmo quando a restauração falhava, travando o resgate manual. Achados só
+  do Fable, e mais graves na prática: (1) `systemctl set-property` sem
+  `--no-ask-password` — quando o polkit não autoriza silenciosamente (visto
+  de verdade em produção, 14:56-14:58 do mesmo dia, por causa do bug de
+  permissão da regra polkit), a chamada abre um diálogo de senha na tela
+  gráfica em vez de falhar rápido, e o processo neto fica órfão; (2)
+  `estado_real()` colapsava qualquer confinamento parcial (um slice
+  restrito, o outro não — possível se a segunda chamada de `on` falhar no
+  meio) para "ECO", fazendo o daemon achar que convergiu enquanto
+  `user.slice` ficava preso em energia total de verdade; (3) a janela de
+  ausência usava `time.time()` (relógio de parede) em vez de
+  `time.monotonic()`, vulnerável a saltos de NTP/RTC (já um problema
+  conhecido nesta máquina). Lição: uma correção "completa" de uma auditoria
+  não esgota a superfície de bugs — vale rodar uma segunda revisão
+  independente antes de considerar um componente de segurança/failsafe
+  estável, principalmente quando ele já mexeu duas vezes na mesma área de
+  código.
 - **Trade-off deixado em aberto, de propósito:** se o operador disparar um
   job pesado remotamente e desconectar em seguida, todos os sinais somem e
   a máquina volta pro modo econômico dentro da janela de tolerância —
