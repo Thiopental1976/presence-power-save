@@ -56,7 +56,10 @@ STATE_FILE = HOME / ".cedro-presence-state"
 LOG_FILE = HOME / "cedro_presence.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
-ABSENCE_WINDOW_S = 600            # 10 min — carência SÓ do lado do celular, nunca do lado da tela
+ABSENCE_WINDOW_S = int(os.environ.get("PRESENCE_ABSENCE_WINDOW_S", "600"))
+# 10 min por padrão — carência SÓ do lado do celular, nunca do lado da tela.
+# Ajustável via PRESENCE_ABSENCE_WINDOW_S no env (ex.: 30 pra testar em modo
+# observador sem esperar 10min por ciclo) sem tocar no valor de produção.
 TICK_SECONDS = 10                 # poll de USB/tela/RustDesk. BT é event-driven, não depende disto.
 
 BLUEZ = "org.bluez"

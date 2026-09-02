@@ -1,0 +1,37 @@
+// cedro_eco_mode.sh precisa chamar `systemctl set-property --runtime
+// system.slice|user.slice AllowedCPUs=...` sem senha interativa (roda de
+// dentro de um daemon systemd --user, sem terminal). Sem esta regra, o
+// script teria que rodar via `sudo` — o que exige um NOPASSWD amplo em
+// /etc/sudoers.d ou trava o daemon pedindo senha que nunca chega.
+//
+// Escopo desta regra: SÓ a ação "set-property" (verb) em EXATAMENTE
+// system.slice ou user.slice (unit) — nunca start/stop/restart/kill de
+// nenhuma unit, e nunca set-property em outra unit qualquer. Isso é bem
+// mais estreito que autorizar org.freedesktop.systemd1.manage-units de
+// forma geral, que cobriria controle total de qualquer serviço do sistema.
+//
+// Restrita a membros do grupo `sudo` (Debian/Ubuntu) — quem já tem
+// privilégio administrativo na máquina, só sem o prompt de senha para
+// esta chamada específica. Não amplia QUEM pode ganhar o privilégio,
+// só remove a fricção interativa de uma ação já estreita.
+//
+// Instalação: copiar para /etc/polkit-1/rules.d/ (root) e reiniciar o
+// polkit — ver README.md.
+
+polkit.addRule(function(action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (verb != "set-property") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (unit != "system.slice" && unit != "user.slice") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
