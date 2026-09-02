@@ -1,0 +1,21 @@
+[Unit]
+Description=Presence Power Save — governor de P/E-cores por presenca do celular + atividade local/RustDesk
+Documentation=file:/home/rodrigo/projetos/presence_power_save/README.md
+After=graphical-session.target
+Wants=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+Environment=DISPLAY=:0
+EnvironmentFile=%h/.config/cedro-presence/env
+ExecStart=/usr/bin/python3 %h/cedro_presence_daemon.py --execute
+ExecStopPost=/bin/bash -c '%h/cedro_eco_mode.sh off --execute || true'
+WatchdogSec=90
+Restart=always
+RestartSec=5
+SyslogIdentifier=cedro-presence
+
+[Install]
+WantedBy=default.target
