@@ -20,6 +20,36 @@
 
 set -euo pipefail
 
+# Expande um range tipo "0-15,20" numa lista de numeros de CPU, um por linha.
+expand_range() {
+    local ranges="$1" part lo hi n
+    IFS=',' read -ra parts <<< "$ranges"
+    for part in "${parts[@]}"; do
+        if [[ "$part" == *-* ]]; then
+            lo=${part%-*}; hi=${part#*-}
+            for ((n = lo; n <= hi; n++)); do echo "$n"; done
+        else
+            echo "$part"
+        fi
+    done
+}
+
+# Maior cpuinfo_max_freq (kHz) entre os CPUs do range dado. Imprime "freq cpu"
+# (freq=0 cpu="" se nao conseguir ler nenhum — chamador decide o que fazer).
+max_freq_khz() {
+    local best=0 best_cpu="" n f v
+    while read -r n; do
+        f="/sys/devices/system/cpu/cpu$n/cpufreq/cpuinfo_max_freq"
+        [[ -r "$f" ]] || continue
+        v=$(cat "$f")
+        if (( v > best )); then
+            best=$v
+            best_cpu=$n
+        fi
+    done < <(expand_range "$1")
+    echo "$best $best_cpu"
+}
+
 detect_topology() {
     if [[ -r /sys/devices/cpu_core/cpus && -r /sys/devices/cpu_atom/cpus ]]; then
         PCORES=$(cat /sys/devices/cpu_core/cpus)
@@ -32,6 +62,27 @@ detect_topology() {
         exit 1
     fi
     ALLCORES=$(cat /sys/devices/system/cpu/online)
+
+    # Validacao cruzada por frequencia: nao confia cegamente no nome do grupo
+    # sysfs (cpu_core/cpu_atom) — confirma que o grupo P realmente TEM a
+    # frequencia maxima mais alta antes de decidir qual lado confinar. Isso
+    # protege a portabilidade pra outras maquinas: se a deteccao por nome
+    # estiver errada (bug de kernel, topologia atipica), aborta em vez de
+    # confinar o lado de alta potencia por engano.
+    read -r p_max p_max_cpu <<< "$(max_freq_khz "$PCORES")"
+    read -r e_max e_max_cpu <<< "$(max_freq_khz "$ECORES")"
+    if [[ -z "$p_max_cpu" || -z "$e_max_cpu" ]]; then
+        echo "AVISO: nao consegui ler cpuinfo_max_freq de algum grupo — pulando a" >&2
+        echo "validacao cruzada de frequencia (seguindo so pelo nome sysfs)." >&2
+    elif (( p_max <= e_max )); then
+        echo "ERRO: o grupo detectado como P-cores ($PCORES, max ${p_max}kHz) NAO tem" >&2
+        echo "frequencia maxima maior que o grupo E-cores ($ECORES, max ${e_max}kHz)." >&2
+        echo "A deteccao de topologia esta inconsistente nesta maquina — abortando" >&2
+        echo "por seguranca em vez de arriscar confinar o lado de alta potencia." >&2
+        exit 1
+    fi
+    PCORES_PEAK_CPU="cpu${p_max_cpu}"
+    PCORES_PEAK_MHZ=$(( p_max / 1000 ))
 }
 
 usage() { echo "Uso: $0 on|off|status [--execute]" >&2; exit 2; }
@@ -54,6 +105,7 @@ case "$action" in
     on)
         detect_topology
         echo "Restringindo o sistema inteiro aos E-cores ($ECORES). P-cores ($PCORES) ficam livres/ociosos."
+        echo "Nucleo de maior potencia entre os P-cores: $PCORES_PEAK_CPU (${PCORES_PEAK_MHZ}MHz max) — ocioso durante o modo eco."
         run systemctl set-property --runtime system.slice "AllowedCPUs=$ECORES"
         run systemctl set-property --runtime user.slice "AllowedCPUs=$ECORES"
         ;;

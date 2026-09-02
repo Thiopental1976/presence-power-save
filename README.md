@@ -108,6 +108,14 @@ script funciona em qualquer máquina híbrida sem editar nada. Numa CPU sem
 essa distinção (a maioria das AMD, Intel pré-Alder-Lake), o script recusa
 rodar com um erro explícito — não há E-cores pra confinar.
 
+Antes de confiar nesses ranges, o script faz uma validação cruzada por
+`cpuinfo_max_freq`: confirma que o grupo identificado como P-cores tem
+frequência máxima maior que o grupo identificado como E-cores. Se não
+tiver, aborta em vez de arriscar confinar o lado de alta potência por um
+nome de grupo sysfs enganoso numa topologia atípica. De quebra, identifica
+e loga qual CPU específica é o núcleo de maior potência entre os P-cores
+(o "favorito" do Turbo Boost Max 3.0, quando existe).
+
 Nem o daemon nem `cedro_eco_mode.sh` chamam `sudo` — a autorização vem de
 uma regra polkit (`polkit/49-cedro-eco-mode.rules`) escopada só pra
 `set-property` em `system.slice`/`user.slice`, restrita a quem já está no
